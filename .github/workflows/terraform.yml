@@ -1,50 +1,60 @@
-name: "Ecom-IAC"
+name: "Vprofile IAC"
+
 on:
   push:
     branches:
       - main
       - stage
     paths:
-      - "terraform/**"
-
+      - terraform/**
   pull_request:
     branches:
       - main
     paths:
-      - "terraform/**"
+      - terraform/**
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: us-east-2
   BUCKET_TF_STATE: ${{ secrets.BUCKET_TF_STATE }}
   EKS_CLUSTER: ecom-eks
 
 jobs:
   terraform:
-    name: Terraform Code Changes
+    name: "Terraform Apply / Destroy"
     runs-on: ubuntu-latest
+
     defaults:
       run:
         shell: bash
         working-directory: ./terraform
+
     steps:
-      - name: Checkout
+      ############################################################
+      # Checkout & AWS Credentials
+      ############################################################
+      - name: Checkout Source Code
         uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
 
+      ############################################################
+      # Terraform Init / Plan / Apply
+      ############################################################
       - name: Terraform Init
-        id: init
         run: terraform init -backend-config="bucket=$BUCKET_TF_STATE"
 
       - name: Terraform fmt
-        id: fmt
         run: terraform fmt -check
 
-      - name: Terraform Validate
-        id: validate
+      - name: Terraform validate
         run: terraform validate
 
       - name: Terraform Plan
@@ -52,30 +62,88 @@ jobs:
         run: terraform plan -no-color -input=false -out planfile
         continue-on-error: true
 
-      - name: Terraform Plan Status
+      - name: Terraform plan status
         if: steps.plan.outcome == 'failure'
         run: exit 1
 
-      - name: Terraform Apply
+      - name: Terraform Apply (main branch only)
         id: apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: terraform apply -auto-approve -input=false -parallelism=1 planfile
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-
-      - name: Get kube config failure
+      ############################################################
+      # Configure kubectl after EKS creation
+      ############################################################
+      - name: Get Kube config
         id: getconfig
         if: steps.apply.outcome == 'success'
-        run: aws eks --region ${{ env.AWS_REGION }} update-kubeconfig --name ${{ env.EKS_CLUSTER }}
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER }}
 
-      - name: Install Ingress Controller
-        if: steps.apply.outcome == 'success' && steps.getconfig.outcome == 'success'
-        run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.1/deploy/static/provider/aws/deploy.yaml
+      ############################################################
+      # CLEAN DESTROY PIPELINE (safe destroy)
+      ############################################################
+      - name: Cleanup Ingress Controller (if present)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          kubectl delete namespace ingress-nginx --ignore-not-found
+          echo "Waiting for AWS Load Balancers to release..."
+          sleep 60
 
+      - name: Delete orphan ELBs (if any)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          LBS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[].LoadBalancerArn" --output text)
+          if [[ "$LBS" != "None" ]]; then
+            for LB in $LBS; do
+              echo "Deleting LB: $LB"
+              aws elbv2 delete-load-balancer --load-balancer-arn $LB || true
+            done
+            echo "Waiting for ELBs to be deleted..."
+            sleep 60
+          fi
 
+      - name: Delete orphan ENIs (EKS leftovers)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          ENIS=$(aws ec2 describe-network-interfaces --filters Name=description,Values="*eks*" --query "NetworkInterfaces[].NetworkInterfaceId" --output text)
+          for ENI in $ENIS; do
+            echo "Deleting ENI $ENI"
+            aws ec2 delete-network-interface --network-interface-id $ENI || true
+          done
 
+      ############################################################
+      # Dynamically Destroy All EKS Node Groups
+      ############################################################
+      - name: Destroy All Node Groups
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          echo "Listing all node groups for cluster ${{ env.EKS_CLUSTER }}..."
+          NODEGROUPS=$(aws eks list-nodegroups --cluster-name ${{ env.EKS_CLUSTER }} --query 'nodegroups' --output text)
+          
+          if [[ -n "$NODEGROUPS" ]]; then
+            for NG in $NODEGROUPS; do
+              echo "Deleting node group $NG..."
+              aws eks delete-nodegroup --cluster-name ${{ env.EKS_CLUSTER }} --nodegroup-name $NG
+            done
+
+            echo "Waiting for node groups to be deleted..."
+            for NG in $NODEGROUPS; do
+              aws eks wait nodegroup-deleted --cluster-name ${{ env.EKS_CLUSTER }} --nodegroup-name $NG
+            done
+          else
+            echo "No node groups found."
+          fi
+
+      ############################################################
+      # Destroy EKS Cluster
+      ############################################################
+      - name: Terraform Destroy Cluster
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform destroy -target=module.eks.aws_eks_cluster.this[0] -auto-approve
+
+      ############################################################
+      # Destroy Remaining Terraform Resources
+      ############################################################
+      - name: Terraform Destroy Remaining Resources
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform destroy -auto-approve -parallelism=1
